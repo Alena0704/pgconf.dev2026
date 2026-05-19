@@ -207,7 +207,7 @@ fig.savefig(out, dpi=130, bbox_inches="tight")
 print(f"  -> {out}")
 plt.close(fig)
 
-# --- Plot 2b: median ratio binned by n_rels --------------------------------
+# --- Plot 2b: absolute planning + execution time binned by n_rels ----------
 N_BINS = [(2, 7, "n=2-7"), (8, 11, "n=8-11"), (12, 13, "n=12-13"),
           (14, 17, "n=14-17"), (18, 99, "n≥18")]
 
@@ -236,34 +236,62 @@ def bin_stats(med_map, cfg):
             out.append((lbl, 0, None, None))
     return out
 
+# Two-panel chart: absolute planning and execution time per n_rels bin,
+# with one bar group per config (pg + all SAIO variants).
+fig, axes = plt.subplots(1, 2, figsize=(13, 5.4), sharey=True)
+
+def bin_abs(med_map, cfg):
+    """Median of the per-query median times for queries inside each n_rels bin."""
+    out = []
+    for lo_n, hi_n, lbl in N_BINS:
+        vals = [med_map[(cfg, q)] for q in queries
+                if (cfg, q) in med_map and lo_n <= n_lookup[q] <= hi_n]
+        if vals:
+            out.append((lbl, len(vals), median(vals)))
+        else:
+            out.append((lbl, 0, None))
+    return out
+
+
+bar_order = ["pg"] + non_pg
+bar_colors = {
+    "pg":             "#1f4e79",
+    "saio_default":   "#7a2f1f",
+    "saio_mid":       "#7a4a1f",
+    "saio_cheap":     "#3a7c2f",
+    "saio_cheap_r3":  "#1f6a72",
+    "saio_cheap_r5":  "#5a1f5f",
+    "saio_cheapest":  "#a3611c",
+}
+
 for ax, (label, med_map) in zip(axes,
                                 [("planning", med_plan),
-                                 ("execution", med_exec),
-                                 ("total e2e", med_total)]):
-    width = 0.8 / len(non_pg)
+                                 ("execution", med_exec)]):
+    width = 0.8 / len(bar_order)
     xs = np.arange(len(N_BINS))
-    for i, cfg in enumerate(non_pg):
-        stats = bin_stats(med_map, cfg)
-        offset = (i - (len(non_pg) - 1) / 2.0) * width
+    for i, cfg in enumerate(bar_order):
+        stats = bin_abs(med_map, cfg)
+        offset = (i - (len(bar_order) - 1) / 2.0) * width
         meds = [s[2] if s[2] is not None else 0 for s in stats]
         ns   = [s[1] for s in stats]
         legend_label = cfg
         if cfg in CFG_PARAMS:
             legend_label = f"{cfg}  [{CFG_PARAMS[cfg]}]"
-        bars = ax.bar(xs + offset, meds, width, label=legend_label, alpha=0.85)
+        color = bar_colors.get(cfg, "#666666")
+        ax.bar(xs + offset, meds, width, label=legend_label, color=color,
+               alpha=0.9, edgecolor="black", linewidth=0.3)
         for x, n, m in zip(xs + offset, ns, meds):
-            if m > 0:
-                ax.text(x, m * 1.04, f"{m:.1f}×\n(n={n})", ha="center",
-                        fontsize=7, color="#222")
-    ax.axhline(1.0, color="black", lw=0.7, ls=":", alpha=0.6)
+            if m and m > 0:
+                ax.text(x, m * 1.08, f"{m:.0f}\n(n={n})", ha="center",
+                        fontsize=6.5, color="#222")
     ax.set_xticks(xs)
     ax.set_xticklabels([b[2] for b in N_BINS], fontsize=9)
     ax.set_yscale("log")
-    ax.set_ylabel(f"median {label} ratio vs pg (log)")
+    ax.set_ylabel(f"median {label} time (ms, log)")
     ax.set_title(label)
     ax.legend(fontsize=7, loc="upper left")
-fig.suptitle(f"SAIO vs PostgreSQL — median per-query ratios binned by n_rels  "
-             f"({src_path.parent.name})\n"
+fig.suptitle(f"SAIO vs PostgreSQL — median per-query planning & execution "
+             f"binned by n_rels  ({src_path.parent.name})\n"
              f"params shown as eq=equilibrium_factor  T=initial_temperature_factor  "
              f"red=temperature_reduction_factor  freeze=moves_before_frozen  R=restarts",
              y=1.02, fontsize=11)
