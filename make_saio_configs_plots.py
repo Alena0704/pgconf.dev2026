@@ -163,7 +163,10 @@ for col, cfg in enumerate(non_pg):
                   f"e2e total · {cfg}",
                   "PG total (ms, log)", f"{cfg} total (ms, log)")
 
-fig.suptitle(f"SAIO configs vs PostgreSQL — JOB n_rels ≥ 12  "
+_min_n = min((n_lookup[q] for q in queries), default=0)
+_max_n = max((n_lookup[q] for q in queries), default=0)
+fig.suptitle(f"SAIO configs vs PostgreSQL — JOB "
+             f"({len(queries)} queries, n_rels {_min_n}–{_max_n})  "
              f"({src_path.parent.name})", y=1.0)
 fig.text(0.5, -0.005, "Below diagonal = config faster than PG; above = slower.",
          ha="center", fontsize=9, style="italic", color="#444")
@@ -208,6 +211,17 @@ plt.close(fig)
 N_BINS = [(2, 7, "n=2-7"), (8, 11, "n=8-11"), (12, 13, "n=12-13"),
           (14, 17, "n=14-17"), (18, 99, "n≥18")]
 
+# GUC parameter labels for each SAIO config — surfaced in the plot legend
+# (and as a subtitle) so the reader doesn't need to dig into the bench script.
+CFG_PARAMS = {
+    "saio_default":   "eq=16  T=2.0  red=0.9  freeze=4  R=1",
+    "saio_mid":       "eq=8   T=2.0  red=0.85 freeze=3  R=1",
+    "saio_cheap":     "eq=4   T=2.0  red=0.7  freeze=2  R=1",
+    "saio_cheap_r3":  "eq=4   T=2.0  red=0.7  freeze=2  R=3",
+    "saio_cheap_r5":  "eq=4   T=2.0  red=0.7  freeze=2  R=5",
+    "saio_cheapest":  "eq=2   T=1.0  red=0.5  freeze=2  R=1",
+}
+
 fig, axes = plt.subplots(1, 3, figsize=(16.5, 5),
                          sharey=True)
 
@@ -233,8 +247,10 @@ for ax, (label, med_map) in zip(axes,
         offset = (i - (len(non_pg) - 1) / 2.0) * width
         meds = [s[2] if s[2] is not None else 0 for s in stats]
         ns   = [s[1] for s in stats]
-        col  = palette.get(cfg, ("#666666", "#aaaaaa"))[0] if False else None
-        bars = ax.bar(xs + offset, meds, width, label=cfg, alpha=0.85)
+        legend_label = cfg
+        if cfg in CFG_PARAMS:
+            legend_label = f"{cfg}  [{CFG_PARAMS[cfg]}]"
+        bars = ax.bar(xs + offset, meds, width, label=legend_label, alpha=0.85)
         for x, n, m in zip(xs + offset, ns, meds):
             if m > 0:
                 ax.text(x, m * 1.04, f"{m:.1f}×\n(n={n})", ha="center",
@@ -245,9 +261,12 @@ for ax, (label, med_map) in zip(axes,
     ax.set_yscale("log")
     ax.set_ylabel(f"median {label} ratio vs pg (log)")
     ax.set_title(label)
-    ax.legend(fontsize=8, loc="upper left")
+    ax.legend(fontsize=7, loc="upper left")
 fig.suptitle(f"SAIO vs PostgreSQL — median per-query ratios binned by n_rels  "
-             f"({src_path.parent.name})", y=1.02)
+             f"({src_path.parent.name})\n"
+             f"params shown as eq=equilibrium_factor  T=initial_temperature_factor  "
+             f"red=temperature_reduction_factor  freeze=moves_before_frozen  R=restarts",
+             y=1.02, fontsize=11)
 plt.tight_layout()
 out = OUT / "saio_configs_by_nrels.png"
 fig.savefig(out, dpi=130, bbox_inches="tight")
@@ -255,18 +274,37 @@ print(f"  -> {out}")
 plt.close(fig)
 
 # --- Plot 3: planning+exec stacked bars per query and config ---------------
-# Only produce for small query sets — at 100+ queries the bars become unreadable.
-if len(queries) > 30:
-    print(f"  skipping planning_vs_exec stacked bars ({len(queries)} queries — too many)")
-    qs = []
+# For large query sets keep only the top-25 by pg total time — these are the
+# queries where the planning/exec split is actually informative.
+TOP_K_FOR_STACK = 25
+if len(queries) > TOP_K_FOR_STACK:
+    by_pg = sorted([q for q in queries if med_total.get(("pg", q)) is not None],
+                   key=lambda q: med_total[("pg", q)], reverse=True)[:TOP_K_FOR_STACK]
+    qs = sorted(by_pg, key=lambda q: (n_lookup[q],
+                                      med_total.get(("pg", q), 0)))
+    stack_title = (f"Planning + execution per query — top {len(qs)} "
+                   f"queries by pg total time (of {len(queries)})")
 else:
     qs = sorted(queries, key=lambda q: (n_lookup[q],
                                         med_total.get(("pg", q), 0)))
+    stack_title = "Planning + execution per query — all configs"
 if qs:
-    n_cfg = len(configs)
-    order = ["pg"] + non_pg
+    # For the stacked planning+exec plot show only pg + the single best SAIO
+    # config (lowest median total ratio).  Multiple saio variants on the same
+    # x-tick are visually overwhelming.
+    def total_med_ratio(cfg):
+        rs = [r[1] for r in ratios(med_total, cfg)]
+        return median(rs) if rs else float("inf")
+    best_saio = min(non_pg, key=total_med_ratio) if non_pg else None
+    order = ["pg"] + ([best_saio] if best_saio else [])
+    n_cfg = len(order)
     width = 0.8 / n_cfg
-    fig, ax = plt.subplots(figsize=(max(10, 0.55 * len(qs) * n_cfg), 6.5))
+    # Width per query group (in inches). Cap height-to-width ratio so the
+    # figure stays readable even for the top-25 subset.
+    per_q = 0.7
+    fig_w = max(14, per_q * len(qs))
+    fig_h = max(8, fig_w / 3.5)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     x = np.arange(len(qs))
     palette = {
         "pg":             ("#1f4e79", "#76a8d8"),
@@ -290,8 +328,9 @@ if qs:
                        rotation=60, ha="right", fontsize=8)
     ax.set_yscale("log")
     ax.set_ylabel("time (ms, log)")
-    ax.set_title("Planning + execution per query — all configs")
-    ax.legend(fontsize=8, ncol=3)
+    title_extra = f" — pg vs {best_saio}" if best_saio else ""
+    ax.set_title(stack_title + title_extra)
+    ax.legend(fontsize=8, ncol=2)
     plt.tight_layout()
     out = OUT / "saio_configs_planning_vs_exec.png"
     fig.savefig(out, dpi=130, bbox_inches="tight")

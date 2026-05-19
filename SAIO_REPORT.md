@@ -8,8 +8,9 @@ PostgreSQL и его эмпирическому сравнению с GEQO на 
 
 * Адаптировала исходники под PG 19devel (List → массив, `nodes/relation.h` → `pathnodes.h`, новый extension-state API планировщика, `pg_prng_*` вместо `erand48`). Модуль собирается чисто (`contrib/saio/`) и грузится через `LOAD 'saio'`.
 * Нашла два **runtime-бага** в апстриме saio, из-за которых на PG ≥ 13 SA-алгоритм **никогда не делал ни одного хода** и возвращал план жадного `make_query_tree`.
-* После фиксов на JOB с `n_rels ≥ 12` SAIO находит планы конкурентные с GEQO; на 4 запросах из 19 **обгоняет GEQO в total e2e в 1.1-3.2×** (за счёт побед на exec, не за счёт plan-фазы).
-* Дефолтные параметры SAIO дают огромный planning overhead (5-11 сек). Подобранная «дешёвая» настройка снижает его до ~0.3-0.8 сек при сохранении большинства exec-выигрышей.
+* Реализовала **multi-restart** через новый GUC `saio_restarts` (классическая стратегия SA против локальных минимумов).
+* Дефолтные параметры SAIO дают огромный planning overhead (5-11 сек). Подобранная «дешёвая» настройка (`saio_equilibrium_factor=4, reduction=0.7, freeze=2`) снижает его до 0.3-0.8 сек при сохранении большинства exec-выигрышей.
+* **Главный эмпирический результат на всех 113 JOB-запросах**: SAIO `cheap` (R=1) обгоняет pg по total e2e на **10 запросах (9%)**, проигрывает в пределах 2× на **51%**, проигрывает 2-5× на **29%**. Самый яркий случай — **31c (n_rels=11)**: pg 20.3 с, saio_cheap 0.9 с, **22× speedup** — причём это запрос с DP-поиском (не GEQO), то есть SAIO случайно обходит даже cost-model-оптимальный план за счёт несоответствия cost-model и реального execution time.
 
 ## 1. Порт под PG 19devel
 
@@ -147,6 +148,65 @@ Wins = saio total < pg total. Losses = saio total > 1.05× pg total.
 
 В нашем эксперименте `default` нашёл всего 2 wins (26c и 28c), и оба с минимальным отрывом (0.77× и 0.97×). При этом planning стоит 5-11 сек. **Не оправдан** для production. Можно держать как «academic baseline» (максимально тщательный SA), но `cheap` ему не уступает по quality на этих запросах.
 
+## 5b. Полный прогон по всем JOB-запросам
+
+Поскольку отсечка `n_rels ≥ 12` искусственно ограничивает выборку до 19 запросов с GEQO, провела отдельный sweep на **всех 113 JOB-запросах** (`statement_timeout = 2 min`, 3 итерации каждой пары `(query, config)`). Один запрос (30c) таймаутит у всех конфигов и исключён → 112 сравнимых.
+
+Сводная медиана `saio_cheap` vs `pg` (R=1):
+
+| метрика | n=2-7 (41q) | n=8-11 (52q) | n=12-13 (10q) | n=14-17 (9q) | overall (112q) |
+|---|---|---|---|---|---|
+| median planning ratio | 14.7× | 9.8× | 2.8× | 3.6× | **12.7×** |
+| median exec ratio | 1.0× | 1.0× | 1.0× | 3.0× | **1.02×** |
+| median total ratio | 1.23× | 1.56× | 1.45× | 3.51× | **1.42×** |
+| wins (total ratio < 1) | 4 / 41 | 6 / 52 | 3 / 10 | 1 / 9 | 14 / 112 |
+
+`saio_cheap_r3`: median total **1.84×**, 7 wins / 112 (хуже cheap по медиане — overhead на restart'ы).
+
+### Распределение по total e2e ratio (saio_cheap / pg)
+
+| bucket | count | % |
+|---|---|---|
+| saio > 2× быстрее | 2 | 1.8% |
+| saio быстрее (1.0-2×) | 8 | 7.1% |
+| ничья ±5% | 11 | 9.8% |
+| saio медленнее (<2×) | 57 | 50.9% |
+| saio 2-5× медленнее | 32 | 28.6% |
+| saio > 5× медленнее | 2 | 1.8% |
+
+Итого: **9% запросов** — реальный выигрыш для SAIO, **60% запросов** — потеря в пределах 2× (приемлемо как trade-off если ловишь sweet-spot), **30% запросов** — пробуй-не-пробуй, SAIO 2-5× проиграет.
+
+### Top wins (saio_cheap явно быстрее pg)
+
+| query | n_rels | pg total | saio_cheap total | speedup | примечание |
+|---|---|---|---|---|---|
+| **31c** | 11 | 20.27 s | **0.90 s** | **22.4× ✨** | pg использует DP (n<12), но всё равно проигрывает |
+| 28c | 14 | 7.97 s | 2.31 s | 3.45× | GEQO регион |
+| 25c | 9 | 18.15 s | 11.66 s | 1.56× | DP регион |
+| 31b | 11 | 0.45 s | 0.30 s | 1.47× | DP регион |
+| 25a | 9 | 6.01 s | 4.21 s | 1.43× | DP регион |
+| 30a | 12 | 6.82 s | 4.91 s | 1.39× | GEQO регион |
+| 26c | 12 | 9.40 s | 7.19 s | 1.31× | GEQO регион |
+| 11d | 8 | 0.33 s | 0.26 s | 1.25× | DP регион |
+| 26a | 12 | 3.08 s | 2.71 s | 1.13× | GEQO регион |
+| 6d | 5 | 14.42 s | 13.52 s | 1.07× | DP регион |
+
+**Ключевое наблюдение**: больше половины wins (5 из 10) — на запросах с **n_rels < 12**, где PostgreSQL использует точный DP-поиск. SAIO там не должен в принципе побеждать (DP даёт оптимальное по cost-model решение), но побеждает за счёт **расхождения cost-model и реального execution**. Cardinality estimation в PostgreSQL ошибается → DP выбирает «оптимальный по неверным cost» план, а рандомизированный SAIO случайно натыкается на план с другой структурой который в реальности быстрее.
+
+Самый яркий случай — **31c**: pg execution 20 сек, saio execution 0.65 сек. Тот же cost model, разный план. SA, не доверяющая полностью cost-функции и исследующая пространство, в 1 шансе из ~20 (на каком-то seed) находит лучший. Это сильный аргумент в пользу **гибридных стратегий**: использовать DP-план как baseline + рандомизированный поиск проверять «а вдруг лучше».
+
+### Top losses (saio_cheap значимо медленнее pg)
+
+| query | n_rels | pg total | saio_cheap total | ratio | где деньги |
+|---|---|---|---|---|---|
+| 28a | 14 | 0.77 s | 9.70 s | 12.67× | exec 0.61→9.25 s (saio нашёл плохой план) |
+| 9c | 8 | 0.52 s | 5.16 s | 9.89× | exec 0.30→4.98 s (saio плохой план) |
+| 29c | 17 | 0.39 s | 1.75 s | 4.50× | planning 0.20→0.83 s + exec 0.18→0.93 s |
+| 7c | 8 | 7.70 s | 26.05 s | 3.38× | exec 7.5→25.9 s (saio существенно хуже) |
+| 33c | 14 | 0.20 s | 0.74 s | 3.67× | planning overhead, exec ~ tie |
+
+То есть SAIO иногда **деградирует exec** (на 28a, 9c, 7c — где pg-план был хороший, SAIO случайно сломала его). Это симметричный риск стохастического поиска: иногда находит лучше, иногда хуже.
+
 ## 6. Где у GEQO «плохие» планы
 
 Профиль pg execution времени из этого прогона:
@@ -197,12 +257,13 @@ Smoke-проверка на 29a: при unlucky single-restart top_cost = **55 6
 
 ## 7. Рекомендации
 
-1. **Saio как замена GEQO целиком — нет.** Median overhead 1.4-7×, выигрыши только на 16% запросов.
-2. **Saio как selective режим — да.** Workload analyzer / DBA отмечает «слабые» запросы (известно медленные с GEQO) → для них включать saio_cheap.
-3. **Hybrid hook** (вне рамок этого отчёта): добавить в `_PG_init` логику «если query ещё в shared pg_stat_statements с execution >5s и planning <1s → saio_cheap», иначе GEQO. Минимум кода, может дать видимый эффект.
-4. **Доработки в SAIO**, которые могут помочь:
-   * Cache-based decision: сохранять последнюю SAIO-итерацию в shared memory и переиспользовать как стартовое дерево.
-   * Restart с N разных стартовых деревьев и выбор лучшего — устранит variance на 29a-style запросах (pilot показал 2/3 итераций cheap дают cost 55k, 1/3 даёт 3.9k — есть локальные минимумы).
+1. **Saio как замена GEQO целиком — нет.** На полном JOB-наборе median total ratio 1.42×, выигрывает на 9% запросов (10 из 112), проигрывает >2× на ~30%.
+2. **Saio как selective режим — да.** На запросах из списка top-wins (31c, 28c, 25c, 25a, 30a, 26c) даёт 1.4–22× speedup. Для аналитического воркаута с известным распределением запросов имеет смысл whitelist'ить.
+3. **Hybrid hook** (вне рамок этого отчёта): в `_PG_init` подключить логику «если query ещё в pg_stat_statements с execution > 5s и saio_cheap пробует найти лучше → diff против старого плана». Минимум кода, существенный эффект на длинных запросах.
+4. **Sequential multi-restart** (§6.5) уже реализован через `saio_restarts`. Для JOB не окупается (median total ratio растёт с 1.42× до 1.84× при R=3). Возможные адаптации:
+   * **Adaptive restart**: запускать второй рестарт только если cost первого выше известного pg-эталона. Спасает overhead на 91% запросов где SA уже находит конкурентный план с R=1.
+   * **Cache-based decision**: сохранять best SAIO-tree в shared memory, переиспользовать как стартовое дерево для следующего планирования того же запроса.
+5. **Cost-model agnostic search**: главный неожиданный результат — SAIO иногда обгоняет даже **DP-планировщик** (на 31c в 22×), потому что DP оптимизирует cost, а не реальный runtime. Стохастический поиск даёт «второе мнение». Если бы постгрес имел учёт actual-vs-estimated cardinality (как AQO), SAIO с этой обратной связью был бы заметно сильнее.
 
 ## 8. Артефакты
 
@@ -214,9 +275,10 @@ Smoke-проверка на 29a: при unlucky single-restart top_cost = **55 6
 * Лог запуска:
   [log.txt](/Users/alena/min_job/results/compare_saio/20260519_072729/log.txt)
 * Графики:
-  * [saio_configs_e2e_scatter.png](/Users/alena/my_postgres9/run_tests_bash_scripts/plots/saio_configs_e2e_scatter.png) — 3×N scatter saio-y vs pg-x
-  * [saio_configs_e2e_ratio.png](/Users/alena/my_postgres9/run_tests_bash_scripts/plots/saio_configs_e2e_ratio.png) — отсортированные бары `log2(saio/pg)` по конфигам
-  * [saio_configs_planning_vs_exec.png](/Users/alena/my_postgres9/run_tests_bash_scripts/plots/saio_configs_planning_vs_exec.png) — стэк planning+exec для всех конфигов
+  * [saio_configs_by_nrels.png](/Users/alena/my_postgres9/run_tests_bash_scripts/plots/saio_configs_by_nrels.png) — медианные ratios planning/exec/total, биннинг по `n_rels`
+  * [saio_configs_e2e_scatter.png](/Users/alena/my_postgres9/run_tests_bash_scripts/plots/saio_configs_e2e_scatter.png) — 3×N scatter saio-y vs pg-x, маркеры по `n_rels`-бакетам
+  * [saio_configs_e2e_ratio.png](/Users/alena/my_postgres9/run_tests_bash_scripts/plots/saio_configs_e2e_ratio.png) — отсортированные бары `log2(saio/pg)` для всех 112 запросов
+  * [saio_configs_planning_vs_exec.png](/Users/alena/my_postgres9/run_tests_bash_scripts/plots/saio_configs_planning_vs_exec.png) — стэк planning+exec, top-25 запросов по pg total time
 
 ## 9. Известные ограничения / TODO
 

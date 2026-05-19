@@ -73,6 +73,22 @@ SAIO_CHEAP="$CHEAP_BASE"$'\nSET saio_restarts = 1;'
 SAIO_CHEAP_R3="$CHEAP_BASE"$'\nSET saio_restarts = 3;'
 SAIO_CHEAP_R5="$CHEAP_BASE"$'\nSET saio_restarts = 5;'
 
+# Even more aggressive: tiny equilibrium, very fast cool.  Saw in the pilot
+# that this often dives into local minima — kept for the binned report.
+SAIO_CHEAPEST=$(cat <<'EOF'
+LOAD 'saio';
+SET saio = on;
+SET geqo = off;
+SET from_collapse_limit = 100;
+SET join_collapse_limit = 100;
+SET saio_equilibrium_factor = 2;
+SET saio_initial_temperature_factor = 1.0;
+SET saio_temperature_reduction_factor = 0.5;
+SET saio_moves_before_frozen = 2;
+SET saio_restarts = 1;
+EOF
+)
+
 cfg_gucs() {
     case "$1" in
         pg)             echo "$PG_BLOCK" ;;
@@ -80,6 +96,7 @@ cfg_gucs() {
         saio_cheap)     echo "$SAIO_CHEAP" ;;
         saio_cheap_r3)  echo "$SAIO_CHEAP_R3" ;;
         saio_cheap_r5)  echo "$SAIO_CHEAP_R5" ;;
+        saio_cheapest)  echo "$SAIO_CHEAPEST" ;;
         *) echo "Unknown config: $1" >&2; return 1 ;;
     esac
     echo "SET statement_timeout = ${STATEMENT_TIMEOUT_MS};"
@@ -160,7 +177,7 @@ echo "Selected $sel_total queries with n_rels >= $MIN_RELS" | tee -a "$LOG"
 
 echo "query,n_rels,config,iter,planning_ms,exec_ms,top_cost" > "$PER_Q"
 
-for cfg in pg saio_cheap saio_cheap_r3; do
+for cfg in pg saio_cheap saio_cheapest; do
     cfg_t_start=$(date +%s)
     printf "[%s] === %s ===\n" "$(date +%H:%M:%S)" "$cfg" | tee -a "$LOG"
     for idx in "${!SEL_QF[@]}"; do
